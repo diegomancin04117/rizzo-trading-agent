@@ -51,10 +51,11 @@ print("---------------------------------------------------\n")
 # -------------------------------------------------------------------
 signal_open = {
     "operation": "close",
-    "symbol": "BNB",
+    "symbol": "SOL",
     "direction": "long",
     "target_portion_of_balance": 0.05,
     "leverage": 2,
+    "stop_loss_percent": 2,
     "reason": "Test apertura posizione long"
 }
 

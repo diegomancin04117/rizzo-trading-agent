@@ -1,11 +1,13 @@
 import pandas as pd
 import ta
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
+# Costante Fee Taker standard Hyperliquid (0.035%)
+TAKER_FEE_RATE = 0.00035
 
 INTERVAL_TO_MS = {
     "1m": 60_000,
@@ -16,7 +18,6 @@ INTERVAL_TO_MS = {
     "1d": 24 * 60 * 60_000,
 }
 
-
 class CryptoTechnicalAnalysisHL:
     """
     Analisi tecnica usando l'API Info di Hyperliquid.
@@ -24,8 +25,59 @@ class CryptoTechnicalAnalysisHL:
     """
 
     def __init__(self, testnet: bool = True):
+        # Se vuoi i prezzi veri usa testnet=False
         base_url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
         self.info = Info(base_url, skip_ws=True)
+        # Cache per i metadati globali (Funding, OI, Mark Price)
+        self._market_state_cache = None
+        self._market_state_timestamp = 0
+
+    # ==============================
+    #       HELPER MARKET STATE
+    # ==============================
+    def _get_global_state(self):
+        """Recupera meta_and_asset_ctxs con una mini-cache per efficienza."""
+        now = datetime.now().timestamp()
+        if self._market_state_cache and (now - self._market_state_timestamp < 2):
+            return self._market_state_cache
+        
+        try:
+            self._market_state_cache = self.info.meta_and_asset_ctxs()
+            self._market_state_timestamp = now
+            return self._market_state_cache
+        except Exception as e:
+            print(f"Warning: Impossibile recuperare stato globale: {e}")
+            return None
+
+    def get_market_details(self, coin: str) -> Dict[str, float]:
+        """
+        Estrae dati reali (Funding, OI, Mark Price) per il coin specificato.
+        """
+        state = self._get_global_state()
+        if not state:
+            return {"funding": 0.0, "oi": 0.0, "mark_px": 0.0}
+
+        universe_dict, contexts_list = state
+        
+        # Cerca indice del coin
+        coin_index = -1
+        try:
+            for idx, asset in enumerate(universe_dict["universe"]):
+                if asset["name"] == coin:
+                    coin_index = idx
+                    break
+        except Exception:
+            return {"funding": 0.0, "oi": 0.0, "mark_px": 0.0}
+
+        if coin_index == -1 or coin_index >= len(contexts_list):
+            return {"funding": 0.0, "oi": 0.0, "mark_px": 0.0}
+
+        ctx = contexts_list[coin_index]
+        return {
+            "funding": float(ctx.get("funding", 0.0)),
+            "oi": float(ctx.get("openInterest", 0.0)),
+            "mark_px": float(ctx.get("markPx", 0.0))
+        }
 
     # ==============================
     #       FETCH OHLCV (HL)
@@ -33,10 +85,9 @@ class CryptoTechnicalAnalysisHL:
 
     def get_orderbook_volume(self, ticker: str) -> str:
         """
-        Restituisce una stringa con i volumi totali di bid e ask per un ticker (es. 'btc-usd').
-        Usa Info.l2_snapshot() dal wrapper ufficiale Hyperliquid.
+        Restituisce una stringa con i volumi totali di bid e ask per un ticker.
         """
-        coin = ticker.split('-')[0].upper()  # es. "BTC" da "btc-usd"
+        coin = ticker.split('-')[0].upper()
 
         try:
             orderbook = self.info.l2_snapshot(coin)
@@ -52,19 +103,11 @@ class CryptoTechnicalAnalysisHL:
         bid_volume = sum(float(level["sz"]) for level in bids)
         ask_volume = sum(float(level["sz"]) for level in asks)
 
-        return f"Bid Vol: {bid_volume}, Ask Vol: {ask_volume}"
+        return f"Bid Vol: {bid_volume:.2f}, Ask Vol: {ask_volume:.2f}"
 
     def fetch_ohlcv(self, coin: str, interval: str, limit: int = 500) -> pd.DataFrame:
         """
         Recupera i dati OHLCV da Hyperliquid tramite Info.candles_snapshot.
-
-        Args:
-            coin: asset Hyperliquid (es. 'BTC', 'ETH')
-            interval: es. '15m', '1d'
-            limit: numero massimo di candele circa (usato per la finestra temporale)
-
-        Returns:
-            DataFrame con colonne: timestamp, open, high, low, close, volume
         """
         if interval not in INTERVAL_TO_MS:
             raise ValueError(f"Interval '{interval}' non supportato in INTERVAL_TO_MS")
@@ -73,7 +116,6 @@ class CryptoTechnicalAnalysisHL:
         step_ms = INTERVAL_TO_MS[interval]
         start_ms = now_ms - limit * step_ms
 
-        # ⚠️ Metodo corretto: candles_snapshot (non candle_snapshot)
         ohlcv_data = self.info.candles_snapshot(
             name=coin,
             interval=interval,
@@ -86,10 +128,8 @@ class CryptoTechnicalAnalysisHL:
 
         df = pd.DataFrame(ohlcv_data)
 
-        # df ha colonne tipo: t, T, o, h, l, c, v, n, s, i
         df["timestamp"] = pd.to_datetime(df["t"], unit="ms", utc=True)
 
-        # tieni solo quello che ci serve
         df = df[["timestamp", "o", "h", "l", "c", "v"]].copy()
         df.rename(
             columns={
@@ -139,24 +179,7 @@ class CryptoTechnicalAnalysisHL:
         return {"pp": pp, "s1": s1, "s2": s2, "r1": r1, "r2": r2}
 
     # ==============================
-    #   FUNDING / OI (placeholder)
-    # ==============================
-    def get_funding_rate(self, coin: str) -> float:
-        """
-        Per ora ritorniamo 0.0 per evitare problemi di compatibilità se
-        la tua versione dell'SDK non espone funding_history.
-        """
-        return 0.0
-
-    def get_open_interest(self, coin: str) -> Dict[str, float]:
-        """
-        Hyperliquid non espone un semplice 'open interest globale' via SDK.
-        Placeholder che ritorna 0.0.
-        """
-        return {"latest": 0.0, "average": 0.0}
-
-    # ==============================
-    #   ANALISI COMPLETA A 15m
+    #       ANALISI COMPLETA A 15m
     # ==============================
     def get_complete_analysis(self, ticker: str) -> Dict:
         coin = ticker.upper()
@@ -204,8 +227,19 @@ class CryptoTechnicalAnalysisHL:
                 last["high"], last["low"], last["close"]
             )
 
-        oi_data = self.get_open_interest(coin)
-        funding_rate = self.get_funding_rate(coin)
+        # --- MODIFICA: Recupero dati reali Market State ---
+        mkt_details = self.get_market_details(coin)
+        funding_rate = mkt_details["funding"]
+        oi_latest = mkt_details["oi"]
+        mark_px = mkt_details["mark_px"]
+
+        # Se il mark price è 0 (errore), usa l'ultimo close
+        if mark_px == 0:
+            mark_px = df_15m.iloc[-1]["close"]
+
+        # Calcolo Fee Stimata (Prezzo Transazione)
+        estimated_fee = mark_px * TAKER_FEE_RATE
+        # --------------------------------------------------
 
         current_15m = df_15m.iloc[-1]
         current_longer = longer_term.iloc[-1]
@@ -224,9 +258,11 @@ class CryptoTechnicalAnalysisHL:
             "pivot_points": pivot_points,
 
             "derivatives": {
-                "open_interest_latest": oi_data["latest"],
-                "open_interest_average": oi_data["average"],
+                "open_interest_latest": oi_latest,
+                # Average OI non è disponibile storicamente via API semplice, metto latest
+                "open_interest_average": oi_latest, 
                 "funding_rate": funding_rate,
+                "estimated_fee_cost": estimated_fee, # NUOVO CAMPO
             },
 
             "intraday": {
@@ -276,11 +312,13 @@ class CryptoTechnicalAnalysisHL:
         output += (
             f"In addition, here is the latest {data['ticker']} funding data on Hyperliquid:\n"
         )
+        # Qui ho aggiornato per mostrare i dati reali e la FEE
         output += (
-            f"Open Interest (placeholder): Latest: {deriv['open_interest_latest']:.2f} "
-            f"Average: {deriv['open_interest_average']:.2f}\n"
+            f"Open Interest: Latest: {deriv['open_interest_latest']:.2f}\n"
         )
-        output += f"Funding Rate: {deriv['funding_rate']:.2e}\n\n"
+        output += f"Funding Rate: {deriv['funding_rate']:.6f}\n"
+        # NUOVA RIGA RICHIESTA: Costo Transazione
+        output += f"Est. Transaction Fee (0.035%): {deriv['estimated_fee_cost']:.4f} USD\n\n"
 
         intra = data["intraday"]
         output += "Intraday series (15m, oldest → latest):\n"
@@ -308,7 +346,7 @@ class CryptoTechnicalAnalysisHL:
         return output
 
 
-def analyze_multiple_tickers(tickers: List[str], testnet: bool = True) -> str:
+def analyze_multiple_tickers(tickers: List[str], testnet: bool = True) -> Tuple[str, List[Dict]]:
     analyzer = CryptoTechnicalAnalysisHL(testnet=testnet)
     full_output = ""
     datas = []
@@ -320,10 +358,12 @@ def analyze_multiple_tickers(tickers: List[str], testnet: bool = True) -> str:
             full_output += analyzer.format_output(data)
         except Exception as e:
             print(f"Errore durante l'analisi di {ticker}: {e}")
+            full_output += f"\nError analyzing {ticker}: {e}\n"
     return full_output, datas
 
 
 # if __name__ == "__main__":
-#     tickers = ["BTC", "ETH", "BNB"]
-#     result = analyze_multiple_tickers(tickers, testnet=True)
-#     print(result)
+#     # Esempio uso: testnet=False per dati reali
+#     tickers = ["BTC", "ETH", "SOL"]
+#     result_str, result_data = analyze_multiple_tickers(tickers, testnet=False)
+#     print(result_str)

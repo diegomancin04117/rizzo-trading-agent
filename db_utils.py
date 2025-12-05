@@ -79,7 +79,8 @@ CREATE TABLE IF NOT EXISTS open_positions (
     mark_price          NUMERIC(30, 10),
     pnl_usd             NUMERIC(30, 10),
     leverage            TEXT,
-    raw_payload         JSONB NOT NULL
+    raw_payload         JSONB NOT NULL,
+    stop_loss_percent   int4
 );
 
 CREATE INDEX IF NOT EXISTS idx_open_positions_snapshot_id
@@ -546,6 +547,7 @@ def log_bot_operation(
     direction = operation_payload.get("direction")
     target_portion_of_balance = operation_payload.get("target_portion_of_balance")
     leverage = operation_payload.get("leverage")
+    stop_loss_percent = operation_payload.get("stop_loss_percent")
 
     # indicators_norm = _normalize_json_arg(indicators) if indicators is not None else None
     sentiment_norm = _normalize_json_arg(sentiment) if sentiment is not None else None
@@ -795,9 +797,10 @@ def log_bot_operation(
                     direction,
                     target_portion_of_balance,
                     leverage,
-                    raw_payload
+                    raw_payload,
+                    stop_loss_percent
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id;
                 """,
                 (
@@ -808,6 +811,7 @@ def log_bot_operation(
                     target_portion_of_balance,
                     leverage,
                     Json(operation_payload),
+                    stop_loss_percent
                 ),
             )
             op_id = cur.fetchone()[0]

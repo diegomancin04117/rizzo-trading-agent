@@ -17,6 +17,7 @@ Rules:
   - symbol: which coin to trade
   - direction: "long" or "short"
   - target_portion_of_balance: % of available cash to use (0.0-1.0)
+  - stop_loss_percent: % of stop loss to set (1, 2, 3)%
   - leverage: leverage multiplier (1-10, higher = more risk/reward)
 - For "close": Close an existing position
   - symbol: which coin position to close
@@ -28,3 +29,5 @@ Rules:
 - You can only close positions that you currently hold (check Current Positions for side: "LONG" or "SHORT")
 - leverage is typically 1-10x; only use high leverage (>5x) if you're very confident
 - Only choose symbols you have price data for
+- Pay a lot of attention to the fees don't open close frequently.
+- Be very careful when you see that in the previous 15 minutes you have taken the stop loss on a position.

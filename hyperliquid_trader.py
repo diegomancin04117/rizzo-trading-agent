@@ -10,6 +10,7 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 
 
+
 class HyperLiquidTrader:
     def __init__(
         self,
@@ -37,7 +38,27 @@ class HyperLiquidTrader:
         # HL accetta max 8 decimali
         size_clamped = size_decimal.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
         return format(size_clamped, "f")   # HL vuole stringa decimale perfetta
-
+    
+    def _round_price(self, price: float) -> float:
+        """
+        Arrotonda il prezzo in base alla sua grandezza (Magnitude).
+        Hyperliquid rifiuta prezzi con troppi decimali per asset ad alto valore.
+        """
+        if price > 5000:
+            # Per BTC o prezzi molto alti, arrotonda a 0 o 1 decimale max
+            return round(price, 0) # Es: 92150.0
+        elif price > 500:
+            # Per ETH, BNB, ecc. max 1 o 2 decimali
+            return round(price, 1) # Es: 3080.1
+        elif price > 10:
+            # Per SOL, AVAX, ecc.
+            return round(price, 2) # Es: 145.23
+        elif price > 1:
+            # Per ARB, MATIC, ecc.
+            return round(price, 4)
+        else:
+            # Per memecoin o prezzi < 1$
+            return round(price, 5) # Es: 0.00123
     # ----------------------------------------------------------------------
     #                            VALIDAZIONE INPUT
     # ----------------------------------------------------------------------
@@ -150,17 +171,55 @@ class HyperLiquidTrader:
     # ----------------------------------------------------------------------
     #                        ESECUZIONE SEGNALE AI
     # ----------------------------------------------------------------------
+    def _place_stop_loss(self, symbol: str, is_buy_sl: bool, size: float, trigger_price: float):
+        """
+        Piazza un ordine Trigger Market (Stop Loss) con reduce_only=True.
+        """
+        print(f"🛡️ Piazzando STOP LOSS per {symbol} a ${trigger_price} (Size: {size})")
+        
+        # Struttura specifica per ordine Trigger su Hyperliquid
+        order_type = {
+            "trigger": {
+                "triggerPx": float(trigger_price),
+                "isMarket": True, 
+                "tpsl": "sl"
+            }
+        }
+
+        try:
+            result = self.exchange.order(
+                name=symbol,
+                is_buy=is_buy_sl,
+                sz=size,
+                limit_px=float(trigger_price), # Cap price per il trigger
+                order_type=order_type,
+                reduce_only=True # FONDAMENTALE: chiude solo, non apre nuove posizioni
+            )
+
+            if result["status"] == "ok":
+                print(f"✅ Stop Loss piazzato: {result['response']['data']['statuses'][0]}")
+            else:
+                print(f"❌ Errore piazzamento Stop Loss: {result}")
+            return result
+            
+        except Exception as e:
+            print(f"❌ Eccezione durante piazzamento SL: {e}")
+            return {"status": "error", "error": str(e)}
+
+    # ----------------------------------------------------------------------
+    #                       ESECUZIONE SEGNALE COMPLETA
+    # ----------------------------------------------------------------------
     def execute_signal(self, order_json: Dict[str, Any]) -> Dict[str, Any]:
         from decimal import Decimal, ROUND_DOWN
+        import time
 
+        # 1. Validazione Input
         self._validate_order_input(order_json)
 
         op = order_json["operation"]
         symbol = order_json["symbol"]
-        direction = order_json["direction"]
-        portion = Decimal(str(order_json["target_portion_of_balance"]))
-        leverage = int(order_json.get("leverage", 1))
-
+        
+        # Gestione operazioni non-trade
         if op == "hold":
             print(f"[HyperLiquidTrader] HOLD — nessuna azione per {symbol}.")
             return {"status": "hold", "message": "No action taken."}
@@ -169,84 +228,66 @@ class HyperLiquidTrader:
             print(f"[HyperLiquidTrader] Market CLOSE per {symbol}")
             return self.exchange.market_close(symbol)
 
-        # OPEN --------------------------------------------------------
-        # Prima di aprire la posizione, imposta la leva desiderata
-        leverage_result = self.set_leverage_for_symbol(
-            symbol=symbol,
-            leverage=leverage,
-            is_cross=True  # Puoi cambiare in False per isolated margin
-        )
+        # ------------------ LOGICA OPEN ------------------
+        direction = order_json["direction"]
+        portion = Decimal(str(order_json["target_portion_of_balance"]))
+        leverage = int(order_json.get("leverage", 1))
         
-        if leverage_result.get('status') != 'ok':
-            print(f"⚠️ Attenzione: impostazione leva potrebbe aver avuto problemi: {leverage_result}")
-        
-        # Piccola pausa per assicurarsi che la leva sia applicata
-        import time
-        time.sleep(0.5)
-        
-        # Verifica la leva attuale dopo l'aggiornamento
-        current_leverage_info = self.get_current_leverage(symbol)
-        print(f"📊 Leva attuale per {symbol}: {current_leverage_info}")
+        # Parametri Stop Loss (Percentuale o Prezzo Fisso)
+        stop_loss_percent = order_json.get("stop_loss_percent", 0)/100
+        sl_percent = float(stop_loss_percent)
+        sl_price_explicit = order_json.get("stop_loss_price")
 
-        # Ora procedi con l'apertura della posizione
+        # 2. Impostazione Leva
+        leverage_result = self.set_leverage_for_symbol(symbol, leverage, is_cross=True)
+        if leverage_result.get('status') != 'ok':
+            print(f"⚠️ Warning leva: {leverage_result}")
+        
+        time.sleep(0.5) # Attesa propagazione
+
+        # 3. Calcolo Size
         user = self.info.user_state(self.account_address)
         balance_usd = Decimal(str(user["marginSummary"]["accountValue"]))
 
         if balance_usd <= 0:
             raise RuntimeError("Balance account = 0")
 
-        notional = balance_usd * portion * Decimal(str(leverage))
-
+        # Recupera prezzo attuale (Mark Price)
         mids = self.info.all_mids()
         if symbol not in mids:
             raise RuntimeError(f"Symbol {symbol} non presente su HL")
-
-        mark_px = Decimal(str(mids[symbol]))
-        raw_size = notional / mark_px
-
-        # Ottieni info sul simbolo dalla meta
-        symbol_info = None
-        for perp in self.meta["universe"]:
-            if perp["name"] == symbol:
-                symbol_info = perp
-                break
         
-        if not symbol_info:
-            raise RuntimeError(f"Symbol {symbol} non trovato nella meta universe")
+        mark_px = float(mids[symbol]) # Float per calcoli SL
+        mark_px_dec = Decimal(str(mark_px)) # Decimal per calcoli Size
 
-        # IMPORTANTE: Ottieni il minimum order size (non szDecimals!)
+        # Calcolo nozionale e size grezza
+        notional = balance_usd * portion * Decimal(str(leverage))
+        raw_size = notional / mark_px_dec
+
+        # Recupera meta-info del simbolo
+        symbol_info = next((p for p in self.meta["universe"] if p["name"] == symbol), None)
+        if not symbol_info:
+            raise RuntimeError(f"Symbol {symbol} non trovato nei metadata")
+
         min_size = Decimal(str(symbol_info.get("minSz", "0.001")))
         sz_decimals = int(symbol_info.get("szDecimals", 8))
-        max_leverage = symbol_info.get("maxLeverage", 100)
 
-        # Verifica che la leva richiesta non superi il massimo
-        if leverage > max_leverage:
-            print(f"⚠️ Leva richiesta ({leverage}) supera il massimo per {symbol} ({max_leverage})")
-
-        # Arrotonda secondo i decimali permessi
+        # Arrotondamento Size
         quantizer = Decimal(10) ** -sz_decimals
         size_decimal = raw_size.quantize(quantizer, rounding=ROUND_DOWN)
 
-        # Verifica che sia sopra il minimo
         if size_decimal < min_size:
-            print(f"⚠️ Size calcolata ({size_decimal}) < minima richiesta ({min_size})")
-            print(f"   Raw size: {raw_size}, Balance: {balance_usd}, Portion: {portion}, Leverage: {leverage}")
-            print(f"   Notional: {notional}, Mark price: {mark_px}")
-            
-            # Usa direttamente il minimum size
+            print(f"⚠️ Size calcolata < min size. Uso min size: {min_size}")
             size_decimal = min_size
 
-        # Converti a float per l'API
         size_float = float(size_decimal)
-
         is_buy = (direction == "long")
 
+        # 4. Esecuzione Ordine Market (ENTRY)
         print(
-            f"\n[HyperLiquidTrader] Market {'BUY' if is_buy else 'SELL'} "
-            f"{size_float} {symbol}\n"
-            f"  💰 Prezzo: ${mark_px}\n"
-            f"  📊 Notional: ${notional:.2f}\n"
-            f"  🎯 Leva target: {leverage}x\n"
+            f"\n[HyperLiquidTrader] Market {'BUY' if is_buy else 'SELL'} {size_float} {symbol}\n"
+            f"  💰 Prezzo Mark: ${mark_px}\n"
+            f"  🎯 Leva: {leverage}x\n"
         )
 
         res = self.exchange.market_open(
@@ -254,9 +295,44 @@ class HyperLiquidTrader:
             is_buy,
             size_float,
             None,
-            0.01
+            0.01 # Slippage tolerance 1%
         )
 
+        # 5. Gestione Stop Loss (Solo se l'ordine di apertura è OK)
+        if res["status"] == "ok":
+            final_sl_price = None
+
+            # A) Priorità al prezzo esplicito
+            if sl_price_explicit:
+                final_sl_price = float(sl_price_explicit)
+            
+            # B) Calcolo percentuale
+            elif sl_percent > 0:
+                print(f"🧮 Calcolo SL automatico: {sl_percent*100}% da {mark_px}")
+                if is_buy: # Se sono Long, SL è sotto
+                    raw_price = mark_px * (1 - sl_percent)
+                else:      # Se sono Short, SL è sopra
+                    raw_price = mark_px * (1 + sl_percent)
+                
+                final_sl_price = self._round_price(raw_price)
+
+            # C) Invio ordine Trigger
+            if final_sl_price:
+                # Se ho aperto LONG, lo SL deve VENDERE (is_buy=False)
+                # Se ho aperto SHORT, lo SL deve COMPRARE (is_buy=True)
+                is_sl_buy = not is_buy 
+
+                sl_res = self._place_stop_loss(
+                    symbol=symbol,
+                    is_buy_sl=is_sl_buy,
+                    size=size_float,
+                    trigger_price=final_sl_price
+                )
+                
+                # Arricchisce la risposta con i dati dello SL
+                res["stop_loss_order"] = sl_res
+                res["stop_loss_price"] = final_sl_price
+        
         return res
 
     # ----------------------------------------------------------------------

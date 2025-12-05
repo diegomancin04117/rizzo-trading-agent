@@ -58,6 +58,12 @@ def previsione_trading_agent(prompt):
                 "minimum": 1,
                 "maximum": 10
             },
+            "stop_loss_percent":{
+                "type": "number",
+                "description":"Stop loss percentage",
+                "minimum": 1,
+                "maximum": 3
+            },
             "reason": {
                 "type": "string",
                 "description": "Brief explanation of the trading decision",
@@ -71,7 +77,8 @@ def previsione_trading_agent(prompt):
             "direction",
             "target_portion_of_balance",
             "leverage",
-            "reason"
+            "reason",
+            "stop_loss_percent"
             ],
             "additionalProperties": False
         }
